@@ -1,11 +1,14 @@
 package benchmark
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 
 	"github.com/golang/glog"
+	controller "k8s.io/kubernetes/cmd/kube-controller-manager/app"
+	controller_options "k8s.io/kubernetes/cmd/kube-controller-manager/app/options"
 	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/resource"
 	"k8s.io/kubernetes/pkg/api/testapi"
@@ -37,25 +40,33 @@ var (
 	}
 )
 
+func mustSetupController() *framework.MasterComponents {
+	config := &framework.Config{
+		MasterConfig:            framework.NewIntegrationTestMasterConfig(),
+		StartReplicationManager: true,
+		DeleteEtcdKeys:          true,
+		QPS:                     5000.0,
+		Burst:                   5000,
+	}
+	m := framework.NewMasterComponents(config)
+
+	destroyFunc = func() {
+		glog.Infof("destroying")
+		m.Stop()
+		glog.Infof("destroyed")
+	}
+
+	return m, destroyFunc
+}
+
 // rate limiting notes:
 //   - The BindPodsRateLimiter is nil, basically not rate limits.
 //   - client rate limit is set to 5000.
 func mustSetupScheduler() (schedulerConfigFactory *factory.ConfigFactory, destroyFunc func()) {
 	framework.DeleteAllEtcdKeys()
 
-	var m *master.Master
-	masterConfig := framework.NewIntegrationTestMasterConfig()
-	m = master.New(masterConfig)
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		m.Handler.ServeHTTP(w, req)
-	}))
-
-	c := client.NewOrDie(&client.Config{
-		Host:         s.URL,
-		GroupVersion: testapi.Default.GroupVersion(),
-		QPS:          5000.0,
-		Burst:        5000,
-	})
+	config := createConfig()
+	c, s := createClient(config)
 
 	schedulerConfigFactory = factory.NewConfigFactory(c, nil)
 	schedulerConfig, err := schedulerConfigFactory.Create()
@@ -74,6 +85,26 @@ func mustSetupScheduler() (schedulerConfigFactory *factory.ConfigFactory, destro
 		glog.Infof("destroyed")
 	}
 	return
+}
+
+func createClient(config *client.Config) (*client.Client, *http.Server) {
+	var m *master.Master
+	masterConfig := framework.NewIntegrationTestMasterConfig()
+	m = master.New(masterConfig)
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		m.Handler.ServeHTTP(w, req)
+	}))
+
+	return client.NewOrDie(config), s
+}
+
+func createConfig() *client.Config {
+	return &client.Config{
+		Host:         s.URL,
+		GroupVersion: testapi.Default.GroupVersion(),
+		QPS:          5000.0,
+		Burst:        5000,
+	}
 }
 
 func makeNodes(c client.Interface, nodeCount int) {
@@ -138,6 +169,51 @@ func makePods(c client.Interface, podCount int) {
 				}
 			}
 		}()
+	}
+	wg.Wait()
+}
+
+func makeRCPods(c client.Interface, rcCount, podsPerRC int) {
+	wg := sync.WaitGroup{}
+	wg.Add(rcCount)
+	for i := 0; i < rcCount; i++ {
+		go func(i int) {
+			defer wg.Done()
+			name := fmt.Sprintf("test-controller-%d", i)
+			rc := &api.ReplicationController{
+				ObjectMeta: api.ObjectMeta{
+					Name: name,
+				},
+				Spec: api.ReplicationControllerSpec{
+					Replicas: podsPerRC,
+					Selector: map[string]string{
+						"name": name,
+					},
+					Template: &api.PodTemplateSpec{
+						ObjectMeta: api.ObjectMeta{
+							Labels: map[string]string{"name": name},
+						},
+						Spec: api.PodSpec{
+							Containers: []api.Container{
+								{
+									Name:  name,
+									Image: "gcr.io/google_containers/pause:1.0",
+									Ports: []api.ContainerPort{{ContainerPort: 80}},
+								},
+							},
+							DNSPolicy: api.DNSDefault,
+						},
+					},
+				},
+			}
+
+			for {
+				_, err := c.ReplicationControllers("default").Create(rc)
+				if err == nil {
+					break
+				}
+			}
+		}(i)
 	}
 	wg.Wait()
 }
